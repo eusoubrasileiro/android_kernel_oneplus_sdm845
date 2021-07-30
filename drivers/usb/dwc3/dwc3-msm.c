@@ -85,6 +85,13 @@ module_param(dwc3_gadget_imod_val, int, 0644);
 MODULE_PARM_DESC(dwc3_gadget_imod_val,
 			"Interrupt moderation in usecs for normal EPs");
 
+//Module param for aca enabling
+// aca must be enabled after device in host mode already
+static bool aca_enable = false; /* start false */
+module_param(aca_enable, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(aca_enable, "Force ACA host mode to allow charging and host.");
+
+
 /* XHCI registers */
 #define USB3_HCSPARAMS1		(0x4)
 #define USB3_HCCPARAMS2		(0x1c)
@@ -159,7 +166,7 @@ struct dwc3_msm_req_complete {
 enum dwc3_drd_state {
 	DRD_STATE_UNDEFINED = 0,
 
-	DRD_STATE_IDLE,
+	DRD_STATE_IDLE, /* in LOWER POWER MODE LPM also nothing connected runtime option */
 	DRD_STATE_PERIPHERAL,
 	DRD_STATE_PERIPHERAL_SUSPEND,
 
@@ -184,9 +191,17 @@ static const char *dwc3_drd_state_string(enum dwc3_drd_state state)
 	return state_names[state];
 }
 
-enum dwc3_id_state {
-	DWC3_ID_GROUND = 0,
-	DWC3_ID_FLOAT,
+/*
+The code in 'drivers\usb\otg\msm_otg.c' suggests that the device can operate in the following 3 modes:
+ID_FLOAT: Configure device to act as peripheral and allow charging if VBUS is present, else move it to LPM (low power mode).
+ID_GROUND: Configure device to act as host and supply VBUS.
+ID_A: Configure device to act as host and don't supply VBUS. In this state the device can charge as well.
+*/
+
+/* physical pin ID state connected to GROUND or not connected */
+enum dwc3_id_state { /* the 5th physical pin 'ID' - OTG status */
+	DWC3_ID_GROUND = 0, /* physical ID pin connected to GROUND - defaul means providing power through vbus and as host*/
+	DWC3_ID_FLOAT, /* physical ID pin not connected (float) - defaul means receving power through vbus and as pheripheral */
 };
 
 /* for type c cable */
@@ -196,12 +211,17 @@ enum plug_orientation {
 	ORIENTATION_CC2,
 };
 
-enum msm_usb_irq {
-	HS_PHY_IRQ,
-	PWR_EVNT_IRQ,
+/*
+quallcomm usb interruption requests IRQs
+making the Kernel run this device code
+*/
+
+enum msm_usb_irq { /* wake-up interruptions for usb-core */
+	HS_PHY_IRQ, /* high speed device physical connection/disconnection */
+	PWR_EVNT_IRQ, /* power event */
 	DP_HS_PHY_IRQ,
 	DM_HS_PHY_IRQ,
-	SS_PHY_IRQ,
+	SS_PHY_IRQ, /* super speed device  physical connetion/disconnection */
 	USB_MAX_IRQ
 };
 
@@ -211,6 +231,7 @@ struct usb_irq {
 	bool enable;
 };
 
+/* interruption requests */
 static const struct usb_irq usb_irq_info[USB_MAX_IRQ] = {
 	{"hs_phy_irq", 0},
 	{"pwr_event_irq", 0},
@@ -226,12 +247,22 @@ static const char * const gsi_op_strings[] = {
 	"FREE_TRBS", "SET_CLR_BLOCK_DBL", "CHECK_FOR_SUSP",
 	"EP_DISABLE", "EP_UPDATE_DB" };
 
-/* Input bits to state machine (mdwc->inputs) */
+/*
+Input bits to state machine (mdwc->inputs) usage:
+set_bit
+clear_bit
+test_bit
+*/
 
-#define ID			0
+/* BIT 0 of state machine IF set means : (1) ID pin disconnect else (0) ID pin connected */
+#define ID		    	0
+/* BIT 1 of state machine IF set means : (1) B device Session Valid threshold on VBus
+						(1) vbus valid to B device -> energy being provided
+						(0) invalid threshold on Vbus  */
 #define B_SESS_VLD		1
-#define B_SUSPEND		2
-#define WAIT_FOR_LPM		3
+#define ID_A            2 /* BIT 2 of state machine IF set means : (0) as host being charged through vbus (1) otherwise */
+#define B_SUSPEND		3 /* BIT 3 of state machine IF set means : (1) B device in suspend state  ... */
+#define WAIT_FOR_LPM	4 /*  A_VBUS_DROP_DET	 4? */
 
 #define PM_QOS_SAMPLE_SEC	2
 #define PM_QOS_THRESHOLD	400
@@ -268,29 +299,38 @@ struct dwc3_msm {
 	int			vbus_retry_count;
 	bool			resume_pending;
 	atomic_t                pm_suspended;
-	struct usb_irq		wakeup_irq[USB_MAX_IRQ];
+	struct usb_irq		wakeup_irq[USB_MAX_IRQ]; /* wake up device interruptions */
 	struct work_struct	resume_work;
 	struct work_struct	restart_usb_work;
 	bool			in_restart;
 	struct workqueue_struct *dwc3_wq;
-	struct delayed_work	sm_work;
-	unsigned long		inputs;
+	struct delayed_work	sm_work; /* statemachine work */
+	unsigned long		inputs; /* store states on driver */
 	unsigned int		max_power;
 	bool			charging_disabled;
-	enum dwc3_drd_state	drd_state;
+	enum dwc3_drd_state	drd_state; /* OTG STATE */
 	u32			bus_perf_client;
 	struct msm_bus_scale_pdata	*bus_scale_table;
-	struct power_supply	*usb_psy;
+	/* the power supply struct from where we can get the type
+	POWER_SUPPLY_PROP_TYPE with
+			power_supply_get_property(mdwc->usb_psy,
+			POWER_SUPPLY_PROP_TYPE, &pval);
+	*/
+	struct power_supply	*usb_psy; /* defined on include/linux/power_supply.h */
 	struct work_struct	vbus_draw_work;
 	bool			in_host_mode;
 	bool			in_device_mode;
 	enum usb_device_speed	max_rh_port_speed;
 	unsigned int		tx_fifo_size;
+/*ID pin is physically grounded (ID_GROUND) :
+	providing energy as host (vbus_active = true)
+ID pin is  physically free (not connected) (ID_FLOAT) :
+	receiving energy as pheripheral (vbus_active = false)  */
 	bool			vbus_active;
 	bool			suspend;
-	bool			disable_host_mode_pm;
+	bool			disable_host_mode_pm; /* never sleeps while charging read from somewhere */
 	bool			use_pdc_interrupts;
-	enum dwc3_id_state	id_state;
+	enum dwc3_id_state	id_state; /* DWC3_ID_GROUND our DWC3_ID_FLOAT */
 	unsigned long		lpm_flags;
 #define MDWC3_SS_PHY_SUSPEND		BIT(0)
 #define MDWC3_ASYNC_IRQ_WAKE_CAPABILITY	BIT(1)
@@ -309,9 +349,9 @@ struct dwc3_msm {
 	struct extcon_dev	*extcon_id;
 	struct extcon_dev	*extcon_eud;
 	struct notifier_block	vbus_nb;
-	struct notifier_block	id_nb;
+	struct notifier_block	id_nb; /* id pin notifyier block calls dwc3_msm_id_notifier */
 	struct notifier_block	eud_event_nb;
-	struct notifier_block	host_restart_nb;
+	struct notifier_block	host_restart_nb; /* calls dwc3_restart_usb_host_mode */
 
 	struct notifier_block	host_nb;
 	bool			xhci_ss_compliance_enable;
@@ -325,7 +365,7 @@ struct dwc3_msm {
 	int pm_qos_latency;
 	struct pm_qos_request pm_qos_req_dma;
 	struct delayed_work perf_vote_work;
-	struct delayed_work sdp_check;
+	struct delayed_work sdp_check; /* standard downstream port charging check - PC connection */
 	bool usb_compliance_mode;
 	struct mutex suspend_resume_mutex;
 
@@ -358,6 +398,40 @@ static void dwc3_msm_notify_event(struct dwc3 *dwc, unsigned int event,
 						unsigned int value);
 static int dwc3_restart_usb_host_mode(struct notifier_block *nb,
 					unsigned long event, void *ptr);
+
+
+/*
+ID_MODE setter on inputs address (driver state machine)
+
+Only called when:
+
+1. Physical ID pin is NOW set to ID_GROUND - OTG Host request
+2. Dual Role State is DRD_STATE_HOST
+
+if aca_enable
+	// it is ACA on
+	// clear ID_A of because now
+	// set ID it will provid energy through vbus
+	ID_MODE = ID_A
+	sets bit 0 ID -> ID pin disconnected
+	clear bit 2 ID_A -> (0) ID_A means charging through vbus
+else
+	// it is ACA off
+	// set ID_A
+	ID_MODE = ID
+	sets bit 2 ID_A -> (0) not charging through vbus
+	clear bit 0 ID -> ID pin connected
+
+
+*/
+static inline void dwc3_aca_toggle_id_ground(struct dwc3_msm *mdwc)
+{
+	ID_MODE = (!aca_enable) ? ID : ID_A;
+	/* ID_MODE = ID_A for aca_enable else ID */
+	set_bit((ID_MODE == ID) ? ID_A : ID, &mdwc->inputs);
+	/* set the oposite bit on inputs state machine */
+	clear_bit(ID_MODE, &mdwc->inputs);
+}
 
 /**
  *
@@ -2022,6 +2096,12 @@ static void dwc3_msm_vbus_draw_work(struct work_struct *w)
 	dwc3_msm_gadget_vbus_draw(mdwc, dwc->vbus_draw);
 }
 
+/*
+receive event notifications
+from core.c controller and when state changed (resume, suspend etc)
+
+take appropriate actions from that
+*/
 static void dwc3_msm_notify_event(struct dwc3 *dwc, unsigned int event,
 							unsigned int value)
 {
@@ -2524,6 +2604,7 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc, bool hibernation)
 	struct dwc3_event_buffer *evt;
 	struct usb_irq *uirq;
 
+	/* lock so it can be written only by here */
 	mutex_lock(&mdwc->suspend_resume_mutex);
 	if (atomic_read(&dwc->in_lpm)) {
 		dev_info(mdwc->dev, "%s: Already suspended\n", __func__);
@@ -2898,21 +2979,38 @@ static int dwc3_msm_resume(struct dwc3_msm *mdwc)
  * dwc3_ext_event_notify - callback to handle events from external transceiver
  *
  * Returns 0 on success
- */
+ * 
+ * External transceiver or resume_work sends when physical usb ID pin changed: 
+ * 		DWC3_ID_GROUND
+ * 		DWC3_ID_FLOAT
+ *  
+ * also when DRD_STATE changed dwc3_drd_state
+ * 
+ * 
+ * calls all pending work on dwc3_otg_sm_work 
+ * 
+ */	
 static void dwc3_ext_event_notify(struct dwc3_msm *mdwc)
 {
+		
+	if(!aca_enable)
+       ID_MODE = ID;
+    else
+       ID_MODE = ID_A;
+
 	/* Flush processing any pending events before handling new ones */
 	flush_delayed_work(&mdwc->sm_work);
 
-	if (mdwc->id_state == DWC3_ID_FLOAT) {
-		dev_info(mdwc->dev, "XCVR: ID set\n");
-		set_bit(ID, &mdwc->inputs);
-	} else {
-		dev_info(mdwc->dev, "XCVR: ID clear\n");
-		clear_bit(ID, &mdwc->inputs);
+	if (mdwc->id_state == DWC3_ID_FLOAT) { /* ID pin disconnected */
+		dev_info(mdwc->dev, "XCVR: ID_MODE set\n");
+		set_bit(ID_MODE, &mdwc->inputs);
+	} else { /* ID pin is NOW at GROUNDED - OTG host call */
+		dev_info(mdwc->dev, "XCVR: ID_MODE clear\n");
+		clear_bit(ID_MODE, &mdwc->inputs);
 	}
 
-	if (mdwc->vbus_active && !mdwc->in_restart) {
+	if (mdwc->vbus_active && !mdwc->in_restart) { /* vbus was active providing energy to someone */
+		/* cable connect  */		
 		dev_info(mdwc->dev, "XCVR: BSV set\n");
 		set_bit(B_SESS_VLD, &mdwc->inputs);
 	} else {
@@ -2931,6 +3029,10 @@ static void dwc3_ext_event_notify(struct dwc3_msm *mdwc)
 	schedule_delayed_work(&mdwc->sm_work, 0);
 }
 
+/*
+called after ID changed
+dwc3_msm_id_notifier
+*/
 static void dwc3_resume_work(struct work_struct *w)
 {
 	struct dwc3_msm *mdwc = container_of(w, struct dwc3_msm, resume_work);
@@ -2943,6 +3045,7 @@ static void dwc3_resume_work(struct work_struct *w)
 	dev_info(mdwc->dev, "%s: dwc3 resume work\n", __func__);
 
 	if (mdwc->vbus_active && !mdwc->in_restart) {
+		/* vbus_active is still active and not in restart */
 		edev = mdwc->extcon_vbus;
 		extcon_id = EXTCON_USB;
 	} else if (mdwc->id_state == DWC3_ID_GROUND) {
@@ -2951,6 +3054,7 @@ static void dwc3_resume_work(struct work_struct *w)
 	}
 
 	/* Check speed and Type-C polarity values in order to configure PHY */
+	/* only enters here if extcon_id == 1 */
 	if (edev && extcon_get_state(edev, extcon_id)) {
 		ret = extcon_get_property(edev, extcon_id,
 					EXTCON_PROP_USB_SS, &val);
@@ -2994,10 +3098,13 @@ static void dwc3_resume_work(struct work_struct *w)
 		ret = extcon_get_property(mdwc->extcon_vbus, EXTCON_USB,
 					EXTCON_PROP_USB_PD_CONTRACT, &val);
 
+		/* @default:	0 (bus powered) */
 		if (!ret)
 			dwc->gadget.self_powered = val.intval;
 		else
 			dwc->gadget.self_powered = 0;
+
+		dev_info(mdwc->dev, "%s dwc->gadget.self_powered %d\n", __func__, dwc->gadget.self_powered);
 	}
 
 	/*
@@ -3020,6 +3127,10 @@ static void dwc3_resume_work(struct work_struct *w)
 	dwc3_ext_event_notify(mdwc);
 }
 
+/*
+Kernel calls this event hander
+when PWR_EVNT_IRQ happens
+*/
 static void dwc3_pwr_event_handler(struct dwc3_msm *mdwc)
 {
 	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
@@ -3098,6 +3209,7 @@ static irqreturn_t msm_dwc3_pwr_irq(int irq, void *data)
 	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
 
 	dwc->t_pwr_evt_irq = ktime_get();
+	/* msm_dwc3_pwr_irq received */
 	dev_info(mdwc->dev, "%s received\n", __func__);
 
 	if (mdwc->drd_state == DRD_STATE_PERIPHERAL_SUSPEND) {
@@ -3248,6 +3360,15 @@ static int dwc3_msm_get_clk_gdsc(struct dwc3_msm *mdwc)
 	return 0;
 }
 
+/*
+what is happening with ID pin on usb port
+A portable product implementing USB 2.0 OTG determines its role
+as either a host or a peripheral by the state of the
+ID pin. With the ID pin at ground (GND (ID_GROUND)), the OTG
+product functions as a USB host and provides VBUS
+to the attached USB peripheral. Otherwise (ID_FLOAT), the OTG
+device functions as a USB peripheral.
+*/
 static int dwc3_msm_id_notifier(struct notifier_block *nb,
 	unsigned long event, void *ptr)
 {
@@ -3257,9 +3378,20 @@ static int dwc3_msm_id_notifier(struct notifier_block *nb,
 
 	id = event ? DWC3_ID_GROUND : DWC3_ID_FLOAT;
 
+	/* 
+	when connects on usb hub:
+		event = 1
+		host: 1 id:0 event received 
+		id=0 DWC3_ID_GROUND  == pin connected providing energy as host
+	when disconnects on usb hub:
+		event = 0
+		host: 0 id:1 event received 
+		id=1 DWC3_ID_FLOAT == pin disconnected
+	*/
+
 	dev_info(mdwc->dev, "host:%ld (id:%d) event received\n", event, id);
 
-	if (mdwc->id_state != id) {
+	if (mdwc->id_state != id) { /* when id is different than previous -> do work */
 		mdwc->id_state = id;
 		dbg_event(0xFF, "id_state", mdwc->id_state);
 		queue_work(mdwc->dwc3_wq, &mdwc->resume_work);
@@ -3268,7 +3400,28 @@ static int dwc3_msm_id_notifier(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+/*
+Standard Downstream Port (SDP) - Charging connection
 
+USB 2.0 Battery Charging Introduction
+
+A USB port is a convenient source of power for devices,
+so devices with a battery Portable Devices (PD) can easely charge their battery
+when connected to a USB host port. To manage this type of battery charging the
+USB Battery charging specification has been created.
+The battery charging specification is a seperate document which focusses on
+PD and charging ports. The specification is there to control the power from
+a charging port to a PD, so that the device will charge at maximum capacity
+within the limitations of the charging port.
+
+Different Charging Ports.
+In the BC1.2 specification there are 3 different charging ports are defined:
+
+Standard Downstream Port (SDP) is a downstream port that complies with
+the USB 2.0 or USB 3.0 definition of a host or hub.
+See drop table for details on the maximum current.
+
+*/
 static void check_for_sdp_connection(struct work_struct *w)
 {
 	struct dwc3_msm *mdwc =
@@ -3278,7 +3431,7 @@ static void check_for_sdp_connection(struct work_struct *w)
 	if (!mdwc->vbus_active)
 		return;
 
-	/* USB 3.1 compliance equipment usually repoted as floating
+	/* USB 3.1 compliance equipment usually reported as floating
 	 * charger as HS dp/dm lines are never connected. Do not
 	 * tear down USB stack if compliance parameter is set
 	 */
@@ -3296,26 +3449,43 @@ static void check_for_sdp_connection(struct work_struct *w)
 
 #define DP_PULSE_WIDTH_MSEC 200
 
+/* 
+cable disconnect only with energy
+receives event 0 
+*/
+
 static int dwc3_msm_vbus_notifier(struct notifier_block *nb,
 	unsigned long event, void *ptr)
 {
 	struct dwc3_msm *mdwc = container_of(nb, struct dwc3_msm, vbus_nb);
 	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
 
+	int psy_type;
+
+	/* vbus energy cable connected received energy event = 1 */
+
 	dev_info(mdwc->dev, "vbus:%ld event received\n", event);
 
-	if (mdwc->vbus_active == event)
+	if (mdwc->vbus_active == event) /* already active vbus */
 		return NOTIFY_DONE;
 
 	mdwc->vbus_active = event;
 
-	if (get_psy_type(mdwc) == POWER_SUPPLY_TYPE_USB_CDP &&
+	psy_type = get_psy_type(mdwc); 
+	/* 
+	POWER_SUPPLY_TYPE_USB_CDP
+	Charging downstream port (CDP) BC1.1 defines this new, higher current 
+	USB port for PCs, laptops, and other hardware. Now the CDP can supply up to 1.5A, 
+	*/
+	dev_info(mdwc->dev, "%s power supply type usb %d\n", __func__, psy_type);	
+
+	if (psy_type == POWER_SUPPLY_TYPE_USB_CDP &&
 			mdwc->vbus_active) {
-		dev_info(mdwc->dev, "Connected to CDP, pull DP up\n");
+		dev_info(mdwc->dev, "Connected to CDP, pull DP (+) up\n");
 		usb_phy_drive_dp_pulse(mdwc->hs_phy, DP_PULSE_WIDTH_MSEC);
 	}
 
-
+	/* resume work */
 	if (dwc->is_drd && !mdwc->in_restart)
 		queue_work(mdwc->dwc3_wq, &mdwc->resume_work);
 
@@ -3520,6 +3690,12 @@ static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
 	return snprintf(buf, PAGE_SIZE, "none\n");
 }
 
+/*
+ID pin is physically grounded (ID_GROUND) :
+	providing energy as host (vbus_active = true)
+ID pin is  physically free (not connected) (ID_FLOAT) :
+	receiving energy as pheripheral (vbus_active = false)
+*/
 static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
 		const char *buf, size_t count)
 {
@@ -3531,7 +3707,7 @@ static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
 	} else if (sysfs_streq(buf, "host")) {
 		mdwc->vbus_active = false;
 		mdwc->id_state = DWC3_ID_GROUND;
-	} else {
+	} else { /* default  */
 		mdwc->vbus_active = false;
 		mdwc->id_state = DWC3_ID_FLOAT;
 	}
@@ -3646,6 +3822,14 @@ static ssize_t xhci_link_compliance_store(struct device *dev,
 
 static DEVICE_ATTR_RW(xhci_link_compliance);
 
+/*
+by SO answer
+This probe function starts the per-device initialization:
+initializing hardware, allocating resources, and registering
+the device with the kernel as a block or network device or whatever it is.
+Probe() happens at the time of device boot or when device is connected.
+
+*/
 static int dwc3_msm_probe(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node, *dwc3_node;
@@ -3689,7 +3873,8 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-	mdwc->id_state = DWC3_ID_FLOAT;
+	/* just initialization state for probing */
+	mdwc->id_state = DWC3_ID_FLOAT; /* start setting the ID pin is not connected */
 	set_bit(ID, &mdwc->inputs);
 
 	mdwc->charging_disabled = of_property_read_bool(node,
@@ -3966,6 +4151,8 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "qcom,connector-type-uAB"))
 		mdwc->type_c = false;
 
+	/* gettting power supply and type of power_supply 
+	if micro usb or type_c usb for fast charging*/
 	mdwc->usb_psy = power_supply_get_by_name("usb");
 	if (!mdwc->usb_psy) {
 		dev_info(mdwc->dev, "Could not get usb power_supply\n");
@@ -4127,6 +4314,9 @@ static int dwc3_msm_remove(struct platform_device *pdev)
 	return 0;
 }
 
+/* called when power supply connected in usb hub
+and device is in host-mode already
+*/
 static int dwc3_msm_host_notifier(struct notifier_block *nb,
 	unsigned long event, void *ptr)
 {
@@ -4177,6 +4367,7 @@ static int dwc3_msm_host_notifier(struct notifier_block *nb,
 				max_power = udev->actconfig->desc.bMaxPower * 8;
 			else
 				max_power = udev->actconfig->desc.bMaxPower * 2;
+			/* notify attached device B of max draw current offered */
 			dev_info(mdwc->dev, "%s configured bMaxPower:%d (mA)\n",
 					dev_name(&udev->dev), max_power);
 
@@ -4185,6 +4376,11 @@ static int dwc3_msm_host_notifier(struct notifier_block *nb,
 			power_supply_set_property(mdwc->usb_psy,
 					POWER_SUPPLY_PROP_BOOST_CURRENT, &pval);
 		} else {
+			/*
+			it was added a power supply it comes here
+			disables energy from host-battery
+			*/
+
 			pval.intval = 0;
 			power_supply_set_property(mdwc->usb_psy,
 					POWER_SUPPLY_PROP_BOOST_CURRENT, &pval);
@@ -4258,16 +4454,19 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 	 * IS_ERR: regulator could not be obtained, so skip using it
 	 * Valid pointer otherwise
 	 */
-	if (!mdwc->vbus_reg && (!mdwc->type_c ||
-				(mdwc->type_c && !mdwc->no_vbus_vote_type_c))) {
-		mdwc->vbus_reg = devm_regulator_get_optional(mdwc->dev,
-					"vbus_dwc3");
-		if (IS_ERR(mdwc->vbus_reg) &&
-				PTR_ERR(mdwc->vbus_reg) == -EPROBE_DEFER) {
-			/* regulators may not be ready, so retry again later */
-			mdwc->vbus_reg = NULL;
-			return -EPROBE_DEFER;
-		}
+	if (!aca_enable){
+		if(!mdwc->vbus_reg)
+			if ((!mdwc->type_c ||
+						(mdwc->type_c && !mdwc->no_vbus_vote_type_c))) {
+				mdwc->vbus_reg = devm_regulator_get_optional(mdwc->dev,
+							"vbus_dwc3");
+				if (IS_ERR(mdwc->vbus_reg) &&
+						PTR_ERR(mdwc->vbus_reg) == -EPROBE_DEFER) {
+					/* regulators may not be ready, so retry again later */
+					mdwc->vbus_reg = NULL;
+					return -EPROBE_DEFER;
+				}
+			}
 	}
 
 	if (on) {
@@ -4284,17 +4483,20 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 		}
 
 		usb_phy_notify_connect(mdwc->hs_phy, USB_SPEED_HIGH);
-		if (!IS_ERR_OR_NULL(mdwc->vbus_reg))
-			ret = regulator_enable(mdwc->vbus_reg);
-		if (ret) {
-			dev_info(mdwc->dev, "unable to enable vbus_reg\n");
-			mdwc->hs_phy->flags &= ~PHY_HOST_MODE;
-			mdwc->ss_phy->flags &= ~PHY_HOST_MODE;
-			pm_runtime_put_sync(mdwc->dev);
-			dbg_event(0xFF, "vregerr psync",
-				atomic_read(&mdwc->dev->power.usage_count));
-			return ret;
-		}
+
+		if(!aca_enable){ /* not aca start vbus regulator power */
+			if (!IS_ERR_OR_NULL(mdwc->vbus_reg))
+				ret = regulator_enable(mdwc->vbus_reg);
+			if (ret) { /* unable to enable vbus_otg */
+				dev_err(mdwc->dev, "unable to enable vbus_reg\n");
+				mdwc->hs_phy->flags &= ~PHY_HOST_MODE;
+				mdwc->ss_phy->flags &= ~PHY_HOST_MODE;
+				pm_runtime_put_sync(mdwc->dev);
+				dbg_event(0xFF, "vregerr psync",
+					atomic_read(&mdwc->dev->power.usage_count));
+				return ret;
+			}
+ 		}
 
 		dwc3_set_mode(dwc, DWC3_GCTL_PRTCAP_HOST);
 
@@ -4308,8 +4510,11 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 			dev_info(mdwc->dev,
 				"%s: failed to add XHCI pdev ret=%d\n",
 				__func__, ret);
-			if (!IS_ERR_OR_NULL(mdwc->vbus_reg))
-				regulator_disable(mdwc->vbus_reg);
+
+			if(!aca_enable)
+				if (!IS_ERR_OR_NULL(mdwc->vbus_reg))
+					regulator_disable(mdwc->vbus_reg);
+
 			mdwc->hs_phy->flags &= ~PHY_HOST_MODE;
 			mdwc->ss_phy->flags &= ~PHY_HOST_MODE;
 			pm_runtime_put_sync(mdwc->dev);
@@ -4364,16 +4569,22 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 		msm_dwc3_perf_vote_update(mdwc, true);
 		schedule_delayed_work(&mdwc->perf_vote_work,
 				msecs_to_jiffies(1000 * PM_QOS_SAMPLE_SEC));
-	} else {
+	} 
+	else {
+
+		/* on=0 time to shutdown HOST mode */
+
 		dev_info(mdwc->dev, "%s: turn off host\n", __func__);
 
 		usb_unregister_atomic_notify(&mdwc->usbdev_nb);
-		if (!IS_ERR_OR_NULL(mdwc->vbus_reg))
-			ret = regulator_disable(mdwc->vbus_reg);
-		if (ret) {
-			dev_info(mdwc->dev, "unable to disable vbus_reg\n");
-			return ret;
-		}
+
+		if(!aca_enable)
+			if (!IS_ERR_OR_NULL(mdwc->vbus_reg))
+				ret = regulator_disable(mdwc->vbus_reg);
+			if (ret) {
+				dev_err(mdwc->dev, "unable to disable vbus_reg\n");
+				return ret;
+			}
 
 		cancel_delayed_work_sync(&mdwc->perf_vote_work);
 		msm_dwc3_perf_vote_update(mdwc, false);
@@ -4554,6 +4765,7 @@ err:
 	return ret;
 }
 
+/* get power supply type */
 static int get_psy_type(struct dwc3_msm *mdwc)
 {
 	union power_supply_propval pval = {0};
@@ -4575,11 +4787,26 @@ static int get_psy_type(struct dwc3_msm *mdwc)
 	return pval.intval;
 }
 
+/* function previously called dwc3_otg_set_power
+had the function to:
+1 - set the mA current for drawing from the connected charger
+2 - set the type of the charger
+
+Now is only called by dwc3_msm_vbus_draw_work by the kernel (workqueue_struct)
+and by dwc3_msm_notify_event when work added on struct.
+There's also a new function 'check_for_sdp_connection'.
+
+SDP - Standard Downstream Port (PC port - gadget mode)
+
+CDP - Charging Downstream Port (CDP) provides data access much
+like an SDP, but also provides at least 1.5A, and as much as 5A, that is available even before bus enumeration.
+*/
 static int dwc3_msm_gadget_vbus_draw(struct dwc3_msm *mdwc, unsigned int mA)
 {
 	union power_supply_propval pval = {0};
 	int ret, psy_type;
 
+	/* mA will be given by the driver data */
 	psy_type = get_psy_type(mdwc);
 	if (psy_type == POWER_SUPPLY_TYPE_USB_FLOAT) {
 		if (!mA)
@@ -4592,11 +4819,23 @@ static int dwc3_msm_gadget_vbus_draw(struct dwc3_msm *mdwc, unsigned int mA)
 	if (mdwc->max_power == mA || psy_type != POWER_SUPPLY_TYPE_USB)
 		return 0;
 
+	/* removing this || psy_type != POWER_SUPPLY_TYPE_USB */
+	/*
+	//Detect?SET as regular charger for notification
+	pval.intval = POWER_SUPPLY_TYPE_USB;
+	power_supply_set_property(mdwc->usb_psy, POWER_SUPPLY_PROP_TYPE, &pval);
+	*/
+
 	dev_info(mdwc->dev, "Avail curr from USB = %u\n", mA);
 	/* Set max current limit in uA */
 	pval.intval = 1000 * mA;
 
 set_prop:
+	/* SDP Standard Downstream Port - PC usb etc. Data + Charge
+	 gadget mode
+	 why set current max and not set
+	 POWER_SUPPLY_PROP_BOOST_CURRENT increase current
+	 */
 	ret = power_supply_set_property(mdwc->usb_psy,
 				POWER_SUPPLY_PROP_SDP_CURRENT_MAX, &pval);
 	if (ret) {
@@ -4614,7 +4853,8 @@ set_prop:
  *
  * @w: Pointer to the dwc3 otg workqueue
  *
- * NOTE: After any change in drd_state, we must reschdule the state machine.
+ * Something just changed - dwc3_resume_work calls this
+ * * NOTE: After any change in drd_state, we must reschdule the state machine.
  */
 static void dwc3_otg_sm_work(struct work_struct *w)
 {
@@ -4624,6 +4864,11 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 	int ret = 0;
 	unsigned long delay = 0;
 	const char *state;
+
+	if(!aca_enable)
+       ID_MODE = ID;
+    else
+       ID_MODE = ID_A;
 
 	if (mdwc->dwc3)
 		dwc = platform_get_drvdata(mdwc->dwc3);
@@ -4638,11 +4883,20 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 	dbg_event(0xFF, state, 0);
 
 	/* Check OTG state */
-	switch (mdwc->drd_state) {
+	/* The OTG A-device is a power supplier, and an OTG B-device is a power consumer.
+	 In the default link configuration, the A-device acts as a USB Host 
+	 with the B-device acting as a USB Device or USB peripheral.
+	 The Host and Device / peripheral modes may be exchanged later by 
+	 using Host Negotiation Protocol (HNP).  */
+	/* Check OTG state - Dual Role Device - DRD */
+	/* state has changed take measures accordingly */
+	switch (mdwc->drd_state){	
 	case DRD_STATE_UNDEFINED:
 		/* put controller and phy in suspend if no cable connected */
-		if (test_bit(ID, &mdwc->inputs) &&
-				!test_bit(B_SESS_VLD, &mdwc->inputs)) {
+		if (test_bit(ID_MODE, &mdwc->inputs) &&
+			!test_bit(B_SESS_VLD, &mdwc->inputs)) {
+		/* test bit of ID to check if 1 pin ID disconnected &&
+		not VBUS active  */
 			dbg_event(0xFF, "undef_id_!bsv", 0);
 			pm_runtime_set_active(mdwc->dev);
 			pm_runtime_enable(mdwc->dev);
@@ -4654,7 +4908,8 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 			mdwc->drd_state = DRD_STATE_IDLE;
 			break;
 		}
-
+		/* in case ID is connected or vbus active
+		DRD_STATE_UNDEFINED causes suspend and STATE_IDLE after */
 		dbg_event(0xFF, "Exit UNDEF", 0);
 		mdwc->drd_state = DRD_STATE_IDLE;
 		pm_runtime_set_suspended(mdwc->dev);
@@ -4666,7 +4921,10 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 			break;
 		}
 
-		if (!test_bit(ID, &mdwc->inputs)) {
+		trace_printk("dwc3-msm.c %d test_bit(id)\n", test_bit(ID, &mdwc->inputs));
+
+		if (!test_bit(ID_MODE, &mdwc->inputs)){
+			/* ID pin connected to GRD or ID_A host-w-bus enabled */
 			dev_info(mdwc->dev, "!id\n");
 			mdwc->drd_state = DRD_STATE_HOST_IDLE;
 			work = 1;
@@ -4697,11 +4955,16 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 		}
 		break;
 
-	case DRD_STATE_PERIPHERAL:
-		if (!test_bit(B_SESS_VLD, &mdwc->inputs) ||
-				!test_bit(ID, &mdwc->inputs)) {
+	case DRD_STATE_PERIPHERAL: /* OTG_STATE_B_PERIPHERAL as OTG B device */
+		if (!test_bit(B_SESS_VLD, &mdwc->inputs) || /* not a valid B session on VBUS*/
+				!test_bit(ID, &mdwc->inputs)) { /* OR */
+					/* aca enabled 
+							ID_A host-w-vbus charge is set
+					   aca disabled
+					   		ID pin connected
+					*/
 			dev_info(mdwc->dev, "!id || !bsv\n");
-			mdwc->drd_state = DRD_STATE_IDLE;
+			mdwc->drd_state = DRD_STATE_IDLE; /* It's IDLE now - OTG_STATE_B_IDLE */
 			cancel_delayed_work_sync(&mdwc->sdp_check);
 			dwc3_otg_start_peripheral(mdwc, 0);
 			/*
@@ -4709,12 +4972,12 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 			 * which was incremented upon cable connect in
 			 * DRD_STATE_IDLE state
 			 */
-			pm_runtime_put_sync_suspend(mdwc->dev);
+			pm_runtime_put_sync_suspend(mdwc->dev); /* put to sleep the boy */
 			dbg_event(0xFF, "!BSV psync",
 				atomic_read(&mdwc->dev->power.usage_count));
 			work = 1;
 		} else if (test_bit(B_SUSPEND, &mdwc->inputs) &&
-			test_bit(B_SESS_VLD, &mdwc->inputs)) {
+			test_bit(B_SESS_VLD, &mdwc->inputs)) { /* B session is valid (it's connected) */
 			dev_info(mdwc->dev, "BPER bsv && susp\n");
 			mdwc->drd_state = DRD_STATE_PERIPHERAL_SUSPEND;
 			/*
@@ -4752,15 +5015,29 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 		}
 		break;
 
-	case DRD_STATE_HOST_IDLE:
+	case DRD_STATE_HOST_IDLE: /* OTG_STATE_A_IDLE */
 		/* Switch to A-Device*/
-		if (test_bit(ID, &mdwc->inputs)) {
+		if (test_bit(ID_MODE, &mdwc->inputs)) { 
+			/*
+			  aca enabled
+			   	ID_A host-w-vbus charge is not set
+			  aca disabled 
+				ID pin disconnected 		   
+			*/
 			dev_info(mdwc->dev, "id\n");
-			mdwc->drd_state = DRD_STATE_IDLE;
+			mdwc->drd_state = DRD_STATE_IDLE; /* OTG_STATE_B_IDLE */
 			mdwc->vbus_retry_count = 0;
 			work = 1;
+			/* staying on here until exit from A-Device */
 		} else {
 			mdwc->drd_state = DRD_STATE_HOST;
+
+			if(aca_enable){
+				/* Set power to charge */
+				schedule_work(&mdwc->vbus_draw_work);
+				/* or quee_work? */
+			}
+
 			ret = dwc3_otg_start_host(mdwc, 1);
 			if ((ret == -EPROBE_DEFER) &&
 						mdwc->vbus_retry_count < 3) {
@@ -4782,7 +5059,7 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 		break;
 
 	case DRD_STATE_HOST:
-		if (test_bit(ID, &mdwc->inputs) || mdwc->hc_died) {
+		if (test_bit(ID_MODE, &mdwc->inputs) || mdwc->hc_died) {
 			dev_info(mdwc->dev, "id || hc_died\n");
 			dwc3_otg_start_host(mdwc, 0);
 			mdwc->drd_state = DRD_STATE_IDLE;
@@ -4841,7 +5118,7 @@ static int dwc3_msm_pm_freeze(struct device *dev)
 	dev_info(dev, "dwc3-msm PM freeze\n");
 	dbg_event(0xFF, "PM Freeze", 0);
 
-	flush_workqueue(mdwc->dwc3_wq);
+	flush_workqueue(mdwc->dwc3_wq); /* run all works on the workquee */
 
 	/* Resume the core to make sure we can power collapse it */
 	ret = dwc3_msm_resume(mdwc);
@@ -4960,8 +5237,9 @@ static const struct dev_pm_ops dwc3_msm_dev_pm_ops = {
 	.restore	= dwc3_msm_pm_restore,
 	.thaw		= dwc3_msm_pm_restore,
 	.poweroff	= dwc3_msm_pm_suspend,
+	/* can be suspended while the system is still runnning */
 	SET_RUNTIME_PM_OPS(dwc3_msm_runtime_suspend, dwc3_msm_runtime_resume,
-				dwc3_msm_runtime_idle)
+				dwc3_msm_runtime_idle) /* this ones are the ones called by the PM core system */
 };
 
 static const struct of_device_id of_dwc3_matach[] = {
@@ -4972,8 +5250,9 @@ static const struct of_device_id of_dwc3_matach[] = {
 };
 MODULE_DEVICE_TABLE(of, of_dwc3_matach);
 
+/* driver registering */
 static struct platform_driver dwc3_msm_driver = {
-	.probe		= dwc3_msm_probe,
+	.probe		= dwc3_msm_probe, /* register the probe function */
 	.remove		= dwc3_msm_remove,
 	.driver		= {
 		.name	= "msm-dwc3",
@@ -4987,6 +5266,11 @@ MODULE_DESCRIPTION("DesignWare USB3 MSM Glue Layer");
 
 static int dwc3_msm_init(void)
 {
+	if(!aca_enable)
+       ID_MODE = ID;
+    else
+       ID_MODE = ID_A;
+
 	return platform_driver_register(&dwc3_msm_driver);
 }
 module_init(dwc3_msm_init);
